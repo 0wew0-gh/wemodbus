@@ -1,7 +1,10 @@
 package wemodbus
 
 import (
+	"errors"
 	"io"
+	"net"
+	"sync"
 	"time"
 
 	"go.bug.st/serial"
@@ -149,3 +152,55 @@ func (s *serialPort) SetReadTimeout(d time.Duration) error {
 }
 
 func (s *serialPort) ResetInputBuffer() error { return s.port.ResetInputBuffer() }
+
+// OpenTCP 连接 Modbus TCP 服务端（主站用）。从站侧请用 net.Listen 接受连接，
+// 再把 net.Conn 交给 NewTCPTransport 与 NewServer。
+func OpenTCP(address string, dialTimeout time.Duration) (Transport, error) {
+	conn, err := net.DialTimeout("tcp", address, dialTimeout)
+	if err != nil {
+		return nil, err
+	}
+	return NewTCPTransport(conn), nil
+}
+
+// NewTCPTransport 把已建立的连接包装成 Transport：测试里可以用 net.Pipe 对接
+// 主站与从站，生产环境的从站则用它包装 Accept 到的连接。
+func NewTCPTransport(conn net.Conn) Transport {
+	return &tcpTransport{conn: conn}
+}
+
+// tcpTransport 把 net.Conn 适配成 Transport：读超时按剩余时间设置 deadline，
+// 超时返回 (0, nil)，与串口驱动的行为一致，因此共享同一套帧读取逻辑。
+type tcpTransport struct {
+	conn net.Conn
+	mu   sync.Mutex
+	d    time.Duration
+}
+
+func (t *tcpTransport) Read(p []byte) (int, error) {
+	t.mu.Lock()
+	d := t.d
+	t.mu.Unlock()
+	if d > 0 {
+		_ = t.conn.SetReadDeadline(time.Now().Add(d))
+	}
+	n, err := t.conn.Read(p)
+	if err != nil {
+		var ne net.Error
+		if errors.As(err, &ne) && ne.Timeout() {
+			return 0, nil
+		}
+		return 0, err
+	}
+	return n, nil
+}
+
+func (t *tcpTransport) Write(p []byte) (int, error) { return t.conn.Write(p) }
+func (t *tcpTransport) Close() error                { return t.conn.Close() }
+
+func (t *tcpTransport) SetReadTimeout(d time.Duration) error {
+	t.mu.Lock()
+	t.d = d
+	t.mu.Unlock()
+	return nil
+}

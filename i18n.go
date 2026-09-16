@@ -197,7 +197,31 @@ var zhMessages = map[string]string{
 	"item %d address %d does not match the declared total: the spec starts at %d and covers %d registers, so this item should start at %d": "第 %d 项的地址 %d 与预设总长度不一致：清单声明从 %d 起共 %d 个寄存器，该项应从 %d 开始",
 	"items cover %d registers (%d~%d), but the declared total is %d":                                                                       "条目共覆盖 %d 个寄存器（%d~%d），与预设总长度 %d 不一致",
 
+	// 从站
+	"RTU request of %d bytes is too short":                "RTU 请求只有 %d 字节，太短",
+	"RTU request declares %d data bytes":                  "RTU 请求声明了 %d 个数据字节",
+	"empty request PDU":                                   "请求 PDU 为空",
+	"unexpected function code 0x%02X":                     "意外的功能码 0x%02X",
+	"request PDU is %d bytes, want %d":                    "请求 PDU %d 字节，期望 %d",
+	"coil value must be 0xFF00 or 0x0000, got 0x%04X":     "线圈值必须是 0xFF00 或 0x0000，实际为 0x%04X",
+	"malformed request PDU for function 0x%02X":           "功能码 0x%02X 的请求 PDU 格式非法",
+	"request declares %d data bytes, got %d":              "请求声明 %d 个数据字节，实际 %d",
+	"quantity %d needs %d data bytes, got %d":             "数量 %d 需要 %d 个数据字节，实际 %d",
+	"quantity is zero":                                    "数量为 0",
+	"address %d + quantity %d exceeds the area length %d": "地址 %d 加数量 %d 超出了数据区长度 %d",
+
+	// Modbus TCP
+	"TCP frame of %d bytes is too short":    "TCP 报文只有 %d 字节，太短",
+	"TCP header of %d bytes is too short":   "TCP 报文头只有 %d 字节，太短",
+	"unexpected protocol id 0x%04X":         "协议标识 0x%04X 不是 0",
+	"MBAP declares %d bytes, got %d":        "MBAP 声明 %d 字节，实际 %d 字节",
+	"MBAP declares %d bytes":                "MBAP 声明的长度 %d 非法",
+	"no complete TCP frame within %d bytes": "%d 字节内没有收到完整的 TCP 报文",
+	"incomplete TCP frame, got %d bytes":    "TCP 报文不完整，只收到 %d 字节",
+	"unexpected transaction id %d, want %d": "事务标识 %d 与请求的 %d 不一致",
+
 	// 从站异常
+	"exception 0x%02X (%s)":                                  "异常 0x%02X（%s）",
 	"exception 0x%02X (%s) from unit %d for function 0x%02X": "异常 0x%02X（%s）：从站 %d，功能码 0x%02X",
 	"unknown exception 0x%02X":                               "未知异常 0x%02X",
 }

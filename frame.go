@@ -14,6 +14,8 @@ const (
 	ModeRTU Mode = iota
 	// ModeASCII 是十六进制 ASCII 模式，帧以 ':' 开始、以 CRLF 结束，LRC 校验。
 	ModeASCII
+	// ModeTCP 是 Modbus TCP 模式，报文由 MBAP 头定界，没有 CRC / LRC。
+	ModeTCP
 )
 
 // String 返回模式名称。
@@ -23,6 +25,8 @@ func (m Mode) String() string {
 		return "RTU"
 	case ModeASCII:
 		return "ASCII"
+	case ModeTCP:
+		return "TCP"
 	default:
 		return fmt.Sprintf("Mode(%d)", int(m))
 	}
@@ -163,5 +167,46 @@ func rtuResponseLength(header []byte) (int, error) {
 		return 8, nil
 	default:
 		return 0, fail(ErrFrame, "unsupported function code 0x%02X", function)
+	}
+}
+
+// rtuRequestLength 根据已读到的帧头推算 RTU 请求的总长度（从站接收用）。
+//
+// 读类与单写类请求固定 8 字节，0x16 为 10 字节；0x0F / 0x10 / 0x17 带字节数域，
+// 需要在读到第 7（或第 11）个字节后才能算出总长。遇到不支持的功能码时按最小的
+// 请求长度 8 字节估算，以便校验通过后回「非法功能码」异常响应；无法确定长度的
+// 请求会由帧读取层的重同步逻辑兜底。
+func rtuRequestLength(frame []byte) (int, error) {
+	if len(frame) < 2 {
+		return 0, fail(ErrFrame, "RTU request of %d bytes is too short", len(frame))
+	}
+	switch frame[1] {
+	case FuncReadCoils, FuncReadDiscreteInputs, FuncReadHoldingRegisters,
+		FuncReadInputRegisters, FuncWriteSingleCoil, FuncWriteSingleRegister:
+		return 8, nil
+	case FuncMaskWriteRegister:
+		return 10, nil
+	case FuncWriteMultipleCoils, FuncWriteMultipleRegisters:
+		// 地址 1 + 功能码 1 + 地址 2 + 数量 2 + 字节数 1 + 数据 N + CRC 2
+		if len(frame) < 7 {
+			return 0, fail(ErrFrame, "RTU request of %d bytes is too short", len(frame))
+		}
+		total := 9 + int(frame[6])
+		if total > MaxRTUFrameSize {
+			return 0, fail(ErrFrame, "RTU request declares %d data bytes", frame[6])
+		}
+		return total, nil
+	case FuncReadWriteMultipleRegisters:
+		// 地址 1 + 功能码 1 + 读地址 2 + 读数量 2 + 写地址 2 + 写数量 2 + 字节数 1 + 数据 N + CRC 2
+		if len(frame) < 11 {
+			return 0, fail(ErrFrame, "RTU request of %d bytes is too short", len(frame))
+		}
+		total := 13 + int(frame[10])
+		if total > MaxRTUFrameSize {
+			return 0, fail(ErrFrame, "RTU request declares %d data bytes", frame[10])
+		}
+		return total, nil
+	default:
+		return 8, nil
 	}
 }

@@ -1,7 +1,6 @@
 package wemodbus
 
 import (
-	"errors"
 	"sync"
 	"time"
 )
@@ -66,6 +65,32 @@ type Client struct {
 	t      Transport
 	cfg    Config
 	closed bool
+	tid    uint16 // TCP 模式的事务标识，每次请求递增
+}
+
+// buildFrame 按当前模式封装请求 PDU：TCP 模式自动分配事务标识。
+func (c *Client) buildFrame(unitID byte, pdu []byte) []byte {
+	if c.cfg.Mode == ModeTCP {
+		c.tid++
+		return BuildTCPFrame(c.tid, unitID, pdu)
+	}
+	return BuildFrame(c.cfg.Mode, unitID, pdu)
+}
+
+// parseFrame 按当前模式拆解响应帧，返回从站地址与 PDU。TCP 模式下会校验响应
+// 的事务标识与最近一次请求一致。
+func (c *Client) parseFrame(adu []byte) (byte, []byte, error) {
+	if c.cfg.Mode == ModeTCP {
+		tid, unitID, pdu, err := ParseTCPFrame(adu)
+		if err != nil {
+			return 0, nil, err
+		}
+		if tid != c.tid {
+			return 0, nil, fail(ErrFrame, "unexpected transaction id %d, want %d", tid, c.tid)
+		}
+		return unitID, pdu, nil
+	}
+	return ParseFrame(c.cfg.Mode, adu)
 }
 
 // Open 按 sc 打开 portName 串口并建立客户端，portName 会覆盖 sc.PortName。
@@ -221,7 +246,7 @@ func (c *Client) transact(pdu []byte, wantResponse bool) ([]byte, error) {
 
 // roundTrip 发送一帧并读取、校验响应，返回响应 PDU。
 func (c *Client) roundTrip(pdu []byte) ([]byte, error) {
-	frame := BuildFrame(c.cfg.Mode, c.cfg.UnitID, pdu)
+	frame := c.buildFrame(c.cfg.UnitID, pdu)
 	if c.cfg.InterFrameDelay > 0 {
 		time.Sleep(c.cfg.InterFrameDelay)
 	}
@@ -233,7 +258,7 @@ func (c *Client) roundTrip(pdu []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	unitID, respPDU, err := ParseFrame(c.cfg.Mode, adu)
+	unitID, respPDU, err := c.parseFrame(adu)
 	if err != nil {
 		return nil, err
 	}
@@ -258,7 +283,7 @@ func (c *Client) roundTrip(pdu []byte) ([]byte, error) {
 
 // broadcast 发送广播请求，并按帧间静默等待从站处理，不读取响应。
 func (c *Client) broadcast(pdu []byte) error {
-	frame := BuildFrame(c.cfg.Mode, 0, pdu)
+	frame := c.buildFrame(0, pdu)
 	c.resetInputBuffer()
 	if _, err := c.t.Write(frame); err != nil {
 		return errorWrap(err, "write failed")
@@ -276,100 +301,16 @@ func (c *Client) resetInputBuffer() {
 	}
 }
 
-// readFrame 按当前模式读取一个完整 ADU，超时由本包自行维护。
+// readFrame 按当前模式读取一个完整响应帧，超时由本包自行维护。
 func (c *Client) readFrame() ([]byte, error) {
-	deadline := time.Now().Add(c.cfg.Timeout)
-	if c.cfg.Mode == ModeASCII {
-		return c.readASCIIFrame(deadline)
+	reader := frameReader{
+		t:         c.t,
+		mode:      c.cfg.Mode,
+		timeout:   c.cfg.Timeout,
+		minPrefix: 3,
+		length:    rtuResponseLength,
 	}
-	return c.readRTUFrame(deadline)
-}
-
-// readChunk 从 Transport 读取一次数据。
-//
-// 返回 (nil, nil) 表示传输层本次没有读到字节（部分串口驱动在超时时返回
-// (0, nil)，因此这里不能依赖错误判断超时）；返回 (nil, ErrTimeout) 表示已过截止时间。
-func (c *Client) readChunk(maxBytes int, deadline time.Time) ([]byte, error) {
-	if maxBytes <= 0 {
-		return nil, fail(ErrFrame, "no room left for more bytes")
-	}
-	remaining := time.Until(deadline)
-	if remaining <= 0 {
-		return nil, ErrTimeout
-	}
-	if err := c.t.SetReadTimeout(remaining); err != nil {
-		return nil, err
-	}
-	buf := make([]byte, maxBytes)
-	n, err := c.t.Read(buf)
-	if err != nil {
-		if time.Now().After(deadline) {
-			return nil, ErrTimeout
-		}
-		return nil, err
-	}
-	if n == 0 {
-		time.Sleep(zeroReadPause)
-		return nil, nil
-	}
-	return buf[:n], nil
-}
-
-// readRTUFrame 先读 3 个字节判断响应类型，再读满整帧。
-func (c *Client) readRTUFrame(deadline time.Time) ([]byte, error) {
-	buf := make([]byte, 0, MaxRTUFrameSize)
-	for {
-		if len(buf) >= 3 {
-			total, err := rtuResponseLength(buf)
-			if err != nil {
-				return nil, err
-			}
-			if len(buf) >= total {
-				return buf[:total], nil
-			}
-		}
-		if len(buf) >= MaxRTUFrameSize {
-			return nil, fail(ErrFrame, "no complete RTU frame within %d bytes", MaxRTUFrameSize)
-		}
-		chunk, err := c.readChunk(MaxRTUFrameSize-len(buf), deadline)
-		if err != nil {
-			if errors.Is(err, ErrTimeout) && len(buf) > 0 {
-				return nil, fail(ErrTimeout, "incomplete RTU frame, got %d bytes", len(buf))
-			}
-			return nil, err
-		}
-		buf = append(buf, chunk...)
-	}
-}
-
-// readASCIIFrame 丢弃帧外字符直到 ':'，再逐字节读到 CRLF。
-func (c *Client) readASCIIFrame(deadline time.Time) ([]byte, error) {
-	buf := make([]byte, 0, MaxASCIIFrameSize)
-	started := false
-	for {
-		if len(buf) >= MaxASCIIFrameSize {
-			return nil, fail(ErrFrame, "no CRLF within %d bytes", MaxASCIIFrameSize)
-		}
-		chunk, err := c.readChunk(MaxASCIIFrameSize-len(buf), deadline)
-		if err != nil {
-			if errors.Is(err, ErrTimeout) && started {
-				return nil, fail(ErrTimeout, "incomplete ASCII frame, got %d bytes", len(buf))
-			}
-			return nil, err
-		}
-		for _, b := range chunk {
-			if !started {
-				if b != asciiStart {
-					continue
-				}
-				started = true
-			}
-			buf = append(buf, b)
-			if len(buf) >= 2 && buf[len(buf)-2] == '\r' && buf[len(buf)-1] == '\n' {
-				return buf, nil
-			}
-		}
-	}
+	return reader.read()
 }
 
 // ReadCoils 读取线圈（功能码 0x01）。

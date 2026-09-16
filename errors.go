@@ -69,7 +69,8 @@ func (c ExceptionCode) String() string {
 	return fmt.Sprintf("unknown exception 0x%02X", byte(c))
 }
 
-// ExceptionError 是从站返回的异常响应（功能码最高位置 1）。
+// ExceptionError 是从站返回的异常响应（功能码最高位置 1），也用于从站侧表示
+// 处理器要回给主站的异常。
 type ExceptionError struct {
 	// UnitID 是响应该请求的从站地址。
 	UnitID byte
@@ -77,12 +78,41 @@ type ExceptionError struct {
 	Function byte
 	// Code 是异常码。
 	Code ExceptionCode
+	// detail 是本地生成的说明（例如数据区越界的地址范围），来自从站处理器。
+	detail string
 }
 
-// Error 实现 error 接口，文本按当前语言（SetLanguage）生成。
+// Error 实现 error 接口，文本按当前语言（SetLanguage）生成。从站侧本地生成的
+// 异常（UnitID 与 Function 均为 0，例如数据区越界）没有请求上下文，只给出异常码
+// 与说明；来自从站响应的异常则带上地址与功能码。
 func (e *ExceptionError) Error() string {
-	return "wemodbus: " + message("exception 0x%02X (%s) from unit %d for function 0x%02X",
-		byte(e.Code), e.Code.text(), e.UnitID, e.Function)
+	var text string
+	if e.UnitID == 0 && e.Function == 0 {
+		text = "wemodbus: " + message("exception 0x%02X (%s)", byte(e.Code), e.Code.text())
+	} else {
+		text = "wemodbus: " + message("exception 0x%02X (%s) from unit %d for function 0x%02X",
+			byte(e.Code), e.Code.text(), e.UnitID, e.Function)
+	}
+	if e.detail != "" {
+		text += ": " + e.detail
+	}
+	return text
+}
+
+// exceptionf 用指定异常码构造一条带说明的错误，供从站处理器（含 DataModel）
+// 返回给 Server：从站会把它转成对应的异常响应，说明只用于日志。
+func exceptionf(code ExceptionCode, format string, args ...interface{}) error {
+	return &ExceptionError{Code: code, detail: message(format, args...)}
+}
+
+// Is 让 errors.Is 可以按异常码匹配，例如
+// errors.Is(err, Exception(ExceptionIllegalDataAddress))。
+func (e *ExceptionError) Is(target error) bool {
+	var other *ExceptionError
+	if errors.As(target, &other) {
+		return e.Code == other.Code
+	}
+	return false
 }
 
 // retryable 判断一次失败的事务是否值得重试。
