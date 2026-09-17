@@ -1,10 +1,11 @@
-// Package wemodbus 实现 Modbus RTU / ASCII 主站（客户端）。
+// Package wemodbus 实现 Modbus RTU / ASCII / TCP 的主站（客户端）与从站（服务端）。
 //
 // # 模式与帧格式
 //
 // RTU 帧为「地址 1 字节 + PDU + CRC16 2 字节」，CRC 低字节在前，帧之间需要
 // 至少 3.5 个字符时间的静默。ASCII 帧为「':' + 地址与 PDU 的十六进制文本 +
-// LRC 2 个字符 + CRLF」，帧界明确，不需要额外的静默时间。
+// LRC 2 个字符 + CRLF」，帧界明确，不需要额外的静默时间。TCP 帧为「MBAP 头
+// 7 字节 + PDU」，帧长由长度域给出，不使用 CRC / LRC。
 //
 // 支持的功能码：
 //
@@ -38,6 +39,15 @@
 //
 // Config.UnitID 为 0 表示广播：只发送不接收，写操作按 Config.InterFrameDelay
 // 等待从站处理，读操作直接返回 ErrBroadcast。
+//
+// # 从站
+//
+// Server 让本程序作为从站服务端接在链路上：真实主站（上位机 / PLC / 组态软件）
+// 读走数据、写下来开关与设定值。请求由 Transport 读入后交给 Handler 处理，
+// DataModel 是现成的内存数据区实现。写请求必然调用 Handler 的对应方法，它是
+// 接入业务逻辑（落库、驱动继电器、启停设备）的钩子，没有额外的事件订阅 API。
+// Server.Serve 阻塞处理请求，直到 Close 或传输层断开（串口拔出、TCP 对端关闭）
+// 时返回；TCP 服务端通常一个连接一个 Server。
 //
 // # 提示语言
 //

@@ -390,13 +390,14 @@ func TestServerStats(t *testing.T) {
 func TestDataModelBounds(t *testing.T) {
 	model := NewDataModel(8, 8, 8, 8)
 
-	if _, err := model.ReadCoils(7, 2); !errors.Is(err, Exception(ExceptionIllegalDataAddress)) {
+	// DataModel 是所有从站地址共用的一块数据区，应用侧直接调用时 unitID 传 0 即可。
+	if _, err := model.ReadCoils(0, 7, 2); !errors.Is(err, Exception(ExceptionIllegalDataAddress)) {
 		t.Fatalf("越界读线圈 = %v, want 非法数据地址", err)
 	}
-	if err := model.WriteMultipleRegisters(7, []uint16{1, 2}); !errors.Is(err, Exception(ExceptionIllegalDataAddress)) {
+	if err := model.WriteMultipleRegisters(0, 7, []uint16{1, 2}); !errors.Is(err, Exception(ExceptionIllegalDataAddress)) {
 		t.Fatalf("越界写寄存器 = %v, want 非法数据地址", err)
 	}
-	if _, err := model.ReadHoldingRegisters(0, 0); !errors.Is(err, Exception(ExceptionIllegalDataAddress)) {
+	if _, err := model.ReadHoldingRegisters(0, 0, 0); !errors.Is(err, Exception(ExceptionIllegalDataAddress)) {
 		t.Fatalf("零长度读 = %v, want 非法数据地址", err)
 	}
 	if err := model.SetDiscreteInput(8, true); !errors.Is(err, Exception(ExceptionIllegalDataAddress)) {
@@ -429,14 +430,14 @@ func TestHandlerErrorMapping(t *testing.T) {
 // errorHandler 是所有读取都返回同一个错误的处理器。
 type errorHandler struct{ err error }
 
-func (h errorHandler) ReadCoils(uint16, uint16) ([]bool, error)              { return nil, h.err }
-func (h errorHandler) ReadDiscreteInputs(uint16, uint16) ([]bool, error)     { return nil, h.err }
-func (h errorHandler) ReadHoldingRegisters(uint16, uint16) ([]uint16, error) { return nil, h.err }
-func (h errorHandler) ReadInputRegisters(uint16, uint16) ([]uint16, error)   { return nil, h.err }
-func (h errorHandler) WriteSingleCoil(uint16, bool) error                    { return h.err }
-func (h errorHandler) WriteSingleRegister(uint16, uint16) error              { return h.err }
-func (h errorHandler) WriteMultipleCoils(uint16, []bool) error               { return h.err }
-func (h errorHandler) WriteMultipleRegisters(uint16, []uint16) error         { return h.err }
+func (h errorHandler) ReadCoils(byte, uint16, uint16) ([]bool, error)              { return nil, h.err }
+func (h errorHandler) ReadDiscreteInputs(byte, uint16, uint16) ([]bool, error)     { return nil, h.err }
+func (h errorHandler) ReadHoldingRegisters(byte, uint16, uint16) ([]uint16, error) { return nil, h.err }
+func (h errorHandler) ReadInputRegisters(byte, uint16, uint16) ([]uint16, error)   { return nil, h.err }
+func (h errorHandler) WriteSingleCoil(byte, uint16, bool) error                    { return h.err }
+func (h errorHandler) WriteSingleRegister(byte, uint16, uint16) error              { return h.err }
+func (h errorHandler) WriteMultipleCoils(byte, uint16, []bool) error               { return h.err }
+func (h errorHandler) WriteMultipleRegisters(byte, uint16, []uint16) error         { return h.err }
 
 func TestSlaveMaskWriteRegisterEndToEnd(t *testing.T) {
 	model := newTestModel()
@@ -499,7 +500,128 @@ func TestSlaveOptionalFunctionsUnsupported(t *testing.T) {
 	}
 }
 
+// unitRecordingHandler 记录每个请求携带的从站地址，用来验证 Server 会把 unitID 传给 Handler。
+type unitRecordingHandler struct {
+	*DataModel
+	mu    sync.Mutex
+	units []byte
+}
+
+func (h *unitRecordingHandler) record(unitID byte) {
+	h.mu.Lock()
+	h.units = append(h.units, unitID)
+	h.mu.Unlock()
+}
+
+func (h *unitRecordingHandler) recorded() []byte {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return append([]byte(nil), h.units...)
+}
+
+func (h *unitRecordingHandler) ReadHoldingRegisters(unitID byte, address, quantity uint16) ([]uint16, error) {
+	h.record(unitID)
+	return h.DataModel.ReadHoldingRegisters(unitID, address, quantity)
+}
+
+func (h *unitRecordingHandler) WriteSingleRegister(unitID byte, address, value uint16) error {
+	h.record(unitID)
+	return h.DataModel.WriteSingleRegister(unitID, address, value)
+}
+
+func TestHandlerReceivesUnitID(t *testing.T) {
+	// ServerConfig.UnitID 为 0 时从站应答任意地址，此时 Handler 必须能分辨请求打的是哪个地址
+	// （RTU 一条总线上挂多台设备时靠它查表区分）。
+	model := NewDataModel(8, 8, 16, 8)
+	if err := model.SetHoldingRegister(0, 0x1234); err != nil {
+		t.Fatalf("SetHoldingRegister: %v", err)
+	}
+	handler := &unitRecordingHandler{DataModel: model}
+
+	c1, c2 := net.Pipe()
+	server := NewServer(NewTCPTransport(c2), ServerConfig{UnitID: 0, Mode: ModeTCP, Timeout: time.Second}, handler)
+	go func() { _ = server.Serve() }()
+	t.Cleanup(func() { _ = server.Close() })
+
+	client := NewClient(NewTCPTransport(c1), Config{UnitID: 1, Mode: ModeTCP, Timeout: time.Second})
+	t.Cleanup(func() { _ = client.Close() })
+
+	for _, unit := range []byte{1, 2, 7} {
+		client.SetUnitID(unit)
+		values, err := client.ReadHoldingRegisters(0, 1)
+		if err != nil {
+			t.Fatalf("从站地址 %d 读取失败：%v", unit, err)
+		}
+		if values[0] != 0x1234 {
+			t.Fatalf("从站地址 %d 读到 %04X, want 1234", unit, values[0])
+		}
+	}
+
+	client.SetUnitID(5)
+	if err := client.WriteSingleRegister(3, 99); err != nil {
+		t.Fatalf("从站地址 5 写入失败：%v", err)
+	}
+
+	want := []byte{1, 2, 7, 5}
+	got := handler.recorded()
+	if len(got) != len(want) {
+		t.Fatalf("Handler 收到的 unitID 序列 = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("Handler 收到的 unitID 序列 = %v, want %v", got, want)
+		}
+	}
+	if v, _ := model.HoldingRegister(3); v != 99 {
+		t.Fatalf("寄存器 3 = %d, want 99", v)
+	}
+}
+
 // buildRequestFrame 构造一个 RTU 请求帧。
 func buildRequestFrame(unitID byte, pdu []byte) []byte {
 	return BuildFrame(ModeRTU, unitID, pdu)
+}
+
+func TestServerServeReturnsOnTransportError(t *testing.T) {
+	// 对端断开（TCP 主站关闭连接、串口被拔出）时必须从 Serve 返回，否则调用方
+	// 只会在一个永远读不到数据的循环里空转。
+	c1, c2 := net.Pipe()
+	server := NewServer(NewTCPTransport(c2), ServerConfig{UnitID: 1, Mode: ModeTCP, Timeout: time.Second},
+		NewDataModel(8, 8, 8, 8))
+	_ = c1.Close() // 主站侧断开
+
+	done := make(chan error, 1)
+	go func() { done <- server.Serve() }()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("Serve 返回 nil，期望传输层错误")
+		}
+	case <-time.After(2 * time.Second):
+		_ = server.Close()
+		t.Fatal("Serve 在传输层断开后没有返回")
+	}
+}
+
+func TestServerServeReturnsNilAfterClose(t *testing.T) {
+	// Close 之后 Serve 正常退出，返回 nil 而不是错误。
+	c1, c2 := net.Pipe()
+	defer c1.Close()
+	server := NewServer(&pipeTransport{conn: c2}, ServerConfig{UnitID: 1, Mode: ModeRTU, Timeout: 50 * time.Millisecond},
+		NewDataModel(8, 8, 8, 8))
+
+	done := make(chan error, 1)
+	go func() { done <- server.Serve() }()
+	time.Sleep(20 * time.Millisecond)
+	_ = server.Close()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Close 后 Serve 返回 %v, want nil", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close 后 Serve 没有返回")
+	}
 }

@@ -12,6 +12,7 @@
 //	go run ./example -port COM3 -spec "04:ABCD:4;1004:float32,1006:float32"    按完整清单读取
 //	go run ./example -port COM3 -write-spec 1004:27.17:float32                按清单批量写
 //	go run ./example -port /dev/ttyUSB0 -mode ascii               使用 ASCII 模式
+//	go run ./example -host 127.0.0.1:1502 -unit 1                 连接 Modbus TCP 从站
 //
 // 从站地址为 0 表示广播：写操作只发不收，读操作会返回 ErrBroadcast。
 package main
@@ -32,6 +33,7 @@ import (
 func main() {
 	var (
 		portName   = flag.String("port", "", "串口名称，例如 COM3 或 /dev/ttyUSB0")
+		host       = flag.String("host", "", "Modbus TCP 服务端地址，例如 127.0.0.1:1502（与 -port 二选一）")
 		baudRate   = flag.Int("baud", 9600, "波特率")
 		dataBits   = flag.Int("databits", 8, "数据位")
 		parityName = flag.String("parity", "none", "校验位：none / odd / even")
@@ -118,7 +120,7 @@ func main() {
 		StopBits: stopBits,
 	}
 
-	client, err := connect(*dryRun, serialCfg, cfg)
+	client, err := connect(*dryRun, *host, serialCfg, cfg)
 	if err != nil {
 		log.Fatalf("建立连接失败：%v", err)
 	}
@@ -202,11 +204,19 @@ func specItems(spec string) []string {
 	return items
 }
 
-// connect 打开真实串口，或用内存回放的 Transport 构造客户端（dry-run）。
-func connect(dryRun bool, serialCfg wemodbus.SerialConfig, cfg wemodbus.Config) (*wemodbus.Client, error) {
+// connect 建立连接：-host 走 Modbus TCP，-port 打开真实串口，-dry-run 用内存回放。
+func connect(dryRun bool, host string, serialCfg wemodbus.SerialConfig, cfg wemodbus.Config) (*wemodbus.Client, error) {
+	if host != "" {
+		transport, err := wemodbus.OpenTCP(host, 3*time.Second)
+		if err != nil {
+			return nil, err
+		}
+		cfg.Mode = wemodbus.ModeTCP // TCP 帧由 MBAP 定界，与 rtu/ascii 参数无关
+		return wemodbus.NewClient(transport, cfg), nil
+	}
 	if !dryRun {
 		if serialCfg.PortName == "" {
-			return nil, errors.New("缺少 -port 参数；没有硬件时可用 -dry-run 演示")
+			return nil, errors.New("缺少 -port 参数；没有硬件时可用 -dry-run 演示，或改用 -host 连接 Modbus TCP 从站")
 		}
 		return wemodbus.Open(serialCfg.PortName, serialCfg, cfg)
 	}

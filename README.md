@@ -18,7 +18,7 @@
 | 0x16 | `MaskWriteRegister` | 掩码写寄存器 |
 | 0x17 | `ReadWriteMultipleRegisters` | 一次事务先写后读 |
 
-不在范围内：Modbus TCP、从站实现、HTTP 接口层、旧 JSON 指令协议。
+不在范围内：HTTP 接口层、旧 JSON 指令协议。主站与从站都支持 RTU / ASCII / TCP 三种传输。
 
 ## 快速开始
 
@@ -79,6 +79,7 @@ go run ./example -port COM3 -function 04 -address 1004 -quantity 2 -order ABCD  
 go run ./example -port COM3 -function 04 -spec 1004:float32,1006:float32          # 按清单批量读
 go run ./example -port COM3 -write-spec 1004:27.17:float32                       # 按清单批量写
 go run ./example -port /dev/ttyUSB0 -mode ascii -order CDAB
+go run ./example -host 127.0.0.1:1502 -unit 1              # 连 Modbus TCP 从站，参数同上
 ```
 
 `-dry-run` 用内存 Transport 回放预置响应帧，没有硬件也能跑通完整流程；它同时
@@ -193,7 +194,12 @@ if errors.As(err, &ex) {
 
 ## 从站（slave）
 
-`Server` 让本库也能扮演 Modbus 设备：从 `Transport` 读请求，交给 `Handler` 处理，再写回应答。`DataModel` 是一个现成的内存数据区实现。
+`Server` 让本程序作为 **Modbus 从站服务端**接在总线上：真实主站（上位机、PLC、组态软件）读走这里的数据、写下来开关与设定值。请求由 `Transport` 读入，交给 `Handler` 处理，再写回应答；`DataModel` 是一个现成的内存数据区实现。
+
+典型用途：
+
+- **被控设备**：主站写线圈 / 寄存器来指挥本程序动作（启停、开关、参数下发），写操作在 `Handler` 里直接触发业务逻辑；主站读输入寄存器看到现场实时值。
+- **采集网关**：本程序把后端的真实数据（数据库、采集器、其它设备）按地址映射出来供上位机轮询，一条总线上还能按从站地址区分不同设备。
 
 ```go
 model := wemodbus.NewDataModel(64, 64, 128, 64) // 线圈 / 离散输入 / 保持寄存器 / 输入寄存器
@@ -206,13 +212,13 @@ if err != nil {
 }
 server := wemodbus.NewServer(port, wemodbus.ServerConfig{UnitID: 1}, model)
 defer server.Close()
-log.Fatal(server.Serve()) // 阻塞处理请求，直到 Close
+log.Fatal(server.Serve()) // 阻塞处理请求，直到 Close 或传输层断开（串口拔出、TCP 对端关闭）
 ```
 
 - 支持功能码 `01/02/03/04/05/06/0F/10`；非法功能码回 `0x01`，越界地址回 `0x02`，数量或数据值非法回 `0x03`，处理器返回普通 error 回 `0x04`。
 - 广播（地址 0）的请求会被执行但不应答；地址不符的帧直接忽略。
 - 总线噪声、半帧残余与回显造成的错位，由「长度推算 + CRC 校验 + 逐字节重同步」处理。
-- 要接自己的后端就实现 `Handler` 接口；返回 `wemodbus.Exception(code)` 可以指定回给主站的异常码。
+- 要接自己的后端就实现 `Handler` 接口：每个方法都会收到当前请求的从站地址 `unitID`，`ServerConfig.UnitID` 为 0（应答任意地址）时靠它区分设备；返回 `wemodbus.Exception(code)` 可以指定回给主站的异常码。
 - `Server.Stats()` 给出请求 / 响应 / 异常 / 忽略的累计计数。
 
 ### 数据区与地址
@@ -258,23 +264,25 @@ _ = model.SetInputRegisters(1006, wemodbus.Float32ToRegisters(55.16, wemodbus.AB
 
 注意手册编号与协议地址的区别：`41001`、`31004` 是 Modicon 传统编号，换算成协议地址分别是 `1000`、`1003`（减 40001 / 减 30001）。主站发到总线上的、以及数据区里使用的，都是这个从 0 开始的协议地址。
 
-`example/slave` 是一个可直接运行的设备模拟器：
+`example/slave` 是一个可直接运行的从站服务端，可以只用网络跑起来（不用接串口硬件）：
 
 ```powershell
-go run ./example/slave -port COM3 -unit 1
+go run ./example/slave -listen :1502 -unit 1     # 作为 Modbus TCP 服务端监听
+go run ./example/slave -port COM3 -unit 1        # 作为串口从站接在总线上
 ```
 
 它把正弦、余弦波写进输入寄存器 0~3（两个 float32，每秒刷新），保持寄存器 0~7 预置为 1000~1007。启动后可以用主站读它：
 
 ```powershell
+go run ./example -host 127.0.0.1:1502 -unit 1 -function 04 -spec "04:ABCD:4;0:float32,2:float32"
 go run ./example -port COM3 -function 04 -spec "04:ABCD:4;0:float32,2:float32"
 ```
 
-示例里的 `persistHandler` 还演示了**感知主站写入并持久化**的做法：在 `DataModel` 外面包一层实现 `Handler`，主站用 `0x05` / `0x06` / `0x0F` / `0x10` 写入时先落库（示例用 map 模拟）再改内存，落库失败回 `0x04` 并保持内存原值。四个写方法都要覆盖——只实现 `WriteSingleRegister` 的话，主站换用 `0x10` 批量写就绕过持久化了。
+示例里的 `persistHandler` 还演示了**感知主站写入并持久化**的做法：在 `DataModel` 外面包一层实现 `Handler`，主站用 `0x05` / `0x06` / `0x0F` / `0x10` 写入时先落库（示例用 map 模拟）再改内存，落库失败回 `0x04` 并保持内存原值。四个写方法都要覆盖——只实现 `WriteSingleRegister` 的话，主站换用 `0x10` 批量写就绕过持久化了。写线圈时还会调用 `applyCoils`，演示「主站下发的开关落到业务动作上」这一步（真实项目里就是驱动继电器、启停设备）。
 
 ### 写入持久化（钩子示例）
 
-`Handler` 就是感知主站写入的钩子：从站收到写请求时必然调用你实现的对应方法，没有额外的事件订阅 API。把 `DataModel` 包一层即可一边维护内存数据区、一边落库：
+`Handler` 就是感知主站写入的钩子：从站收到写请求时必然调用你实现的对应方法，没有额外的事件订阅 API。每个方法的第一个参数 `unitID` 是当前请求的从站地址，`ServerConfig.UnitID` 为 0（应答任意地址）时可以用它区分设备。把 `DataModel` 包一层即可一边维护内存数据区、一边落库：
 
 ```go
 type persistHandler struct {
@@ -283,21 +291,21 @@ type persistHandler struct {
 }
 
 // 0x06 写单个保持寄存器：先落库，成功后再改内存
-func (h persistHandler) WriteSingleRegister(address, value uint16) error {
-    if _, err := h.db.Exec("UPDATE regs SET value = ? WHERE addr = ?", value, address); err != nil {
+func (h persistHandler) WriteSingleRegister(unitID byte, address, value uint16) error {
+    if _, err := h.db.Exec("UPDATE regs SET value = ? WHERE unit = ? AND addr = ?", value, unitID, address); err != nil {
         return wemodbus.Exception(wemodbus.ExceptionSlaveDeviceFailure) // 主站收到 0x04
     }
-    return h.DataModel.WriteSingleRegister(address, value)
+    return h.DataModel.WriteSingleRegister(unitID, address, value)
 }
 
 // 0x10 写多个保持寄存器：一个事务里写完，再改内存
-func (h persistHandler) WriteMultipleRegisters(address uint16, values []uint16) error {
+func (h persistHandler) WriteMultipleRegisters(unitID byte, address uint16, values []uint16) error {
     tx, err := h.db.Begin()
     if err != nil {
         return wemodbus.Exception(wemodbus.ExceptionSlaveDeviceFailure)
     }
     for i, v := range values {
-        if _, err := tx.Exec("UPDATE regs SET value = ? WHERE addr = ?", v, address+uint16(i)); err != nil {
+        if _, err := tx.Exec("UPDATE regs SET value = ? WHERE unit = ? AND addr = ?", v, unitID, address+uint16(i)); err != nil {
             _ = tx.Rollback()
             return wemodbus.Exception(wemodbus.ExceptionSlaveDeviceFailure)
         }
@@ -305,25 +313,25 @@ func (h persistHandler) WriteMultipleRegisters(address uint16, values []uint16) 
     if err := tx.Commit(); err != nil {
         return wemodbus.Exception(wemodbus.ExceptionSlaveDeviceFailure)
     }
-    return h.DataModel.WriteMultipleRegisters(address, values)
+    return h.DataModel.WriteMultipleRegisters(unitID, address, values)
 }
 
 // 0x05 写单个线圈
-func (h persistHandler) WriteSingleCoil(address uint16, on bool) error {
-    if _, err := h.db.Exec("UPDATE coils SET value = ? WHERE addr = ?", on, address); err != nil {
+func (h persistHandler) WriteSingleCoil(unitID byte, address uint16, on bool) error {
+    if _, err := h.db.Exec("UPDATE coils SET value = ? WHERE unit = ? AND addr = ?", on, unitID, address); err != nil {
         return wemodbus.Exception(wemodbus.ExceptionSlaveDeviceFailure)
     }
-    return h.DataModel.WriteSingleCoil(address, on)
+    return h.DataModel.WriteSingleCoil(unitID, address, on)
 }
 
 // 0x0F 写多个线圈
-func (h persistHandler) WriteMultipleCoils(address uint16, values []bool) error {
+func (h persistHandler) WriteMultipleCoils(unitID byte, address uint16, values []bool) error {
     for i, v := range values {
-        if _, err := h.db.Exec("UPDATE coils SET value = ? WHERE addr = ?", v, address+uint16(i)); err != nil {
+        if _, err := h.db.Exec("UPDATE coils SET value = ? WHERE unit = ? AND addr = ?", v, unitID, address+uint16(i)); err != nil {
             return wemodbus.Exception(wemodbus.ExceptionSlaveDeviceFailure)
         }
     }
-    return h.DataModel.WriteMultipleCoils(address, values)
+    return h.DataModel.WriteMultipleCoils(unitID, address, values)
 }
 ```
 
@@ -335,6 +343,7 @@ server := wemodbus.NewServer(port, wemodbus.ServerConfig{UnitID: 1}, persistHand
 
 几点必须注意：
 
+- **`unitID` 是当前请求的从站地址**：`ServerConfig.UnitID` 为 0 时从站应答任意地址，用它区分设备（例如查 `slave_map[unitID]`）；`DataModel` 是单块数据区，会忽略这个参数。
 - **四个写方法都要实现**（`0x05` / `0x06` / `0x0F` / `0x10`）；启用了 `0x16` / `0x17` 的可选接口时也要一并覆盖。
 - **顺序是先落库、再改内存**。反过来写会在数据库失败时造成“内存是新值、库里是旧值”，而主站收到的是异常。
 - **失败要返回异常**：`wemodbus.Exception(wemodbus.ExceptionSlaveDeviceFailure)` 让主站收到 `0x04`，`ExceptionIllegalDataValue` 对应 `0x03`，以此类推。
@@ -362,6 +371,8 @@ go func() { log.Fatal(server.Serve()) }()
 
 - 主站每次请求自动分配递增的事务标识，响应的事务标识与请求不符时按 `ErrFrame` 处理。
 - 从站把请求的事务标识原样回填；单元标识 0 仍是广播（执行但不应答）。
+- TCP 服务端通常「一个连接一个 `Server`」：`Serve` 在对端断开时返回错误，监听循环继续
+  `Accept` 下一个连接即可，`example/slave -listen :1502` 就是这个写法。
 - 测试里可以用 `net.Pipe()` 配 `NewTCPTransport` 把主站与从站在内存中对接，本仓库的 `tcp_test.go` 就是这么做的。
 - TCP 下 `InterFrameDelay` 没有意义，`Client` 的帧间静默逻辑只对 RTU 生效。
 

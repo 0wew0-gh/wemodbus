@@ -107,11 +107,6 @@ func fail(sentinel error, format string, args ...interface{}) error {
 	}
 }
 
-// errorf 构造一条不带哨兵的本地化提示。
-func errorf(format string, args ...interface{}) error {
-	return errors.New("wemodbus: " + message(format, args...))
-}
-
 // errorWrap 构造一条包装底层错误的本地化提示。
 func errorWrap(err error, format string, args ...interface{}) error {
 	return fmt.Errorf("%s: %w", "wemodbus: "+message(format, args...), err)

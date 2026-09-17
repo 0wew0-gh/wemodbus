@@ -85,11 +85,19 @@ func (s *Server) Serve() error {
 			if errors.Is(err, ErrTimeout) {
 				continue // 总线空闲，继续等下一帧
 			}
+			// 帧本身坏了（CRC/LRC 不符、字节数不对）时丢帧重新对准，总线还能继续用。
+			if errors.Is(err, ErrFrame) {
+				if s.isClosed() {
+					return nil
+				}
+				s.countIgnored()
+				continue
+			}
+			// 其余错误来自传输层（串口拔出、TCP 对端断开等），再循环只会空转，交给调用方处理。
 			if s.isClosed() {
 				return nil
 			}
-			s.countIgnored()
-			continue
+			return err
 		}
 		s.serveFrame(frame)
 	}
@@ -137,7 +145,7 @@ func (s *Server) serveFrame(frame []byte) {
 	}
 	s.countRequest()
 
-	response := s.handle(pdu)
+	response := s.handle(unitID, pdu)
 	if response == nil {
 		s.countIgnored()
 		return
@@ -168,38 +176,38 @@ func (s *Server) acceptUnit(unitID byte) bool {
 }
 
 // handle 处理请求 PDU 并返回响应 PDU；返回 nil 表示不应答（请求格式非法）。
-func (s *Server) handle(pdu []byte) []byte {
+func (s *Server) handle(unitID byte, pdu []byte) []byte {
 	if len(pdu) == 0 {
 		return nil
 	}
 	function := pdu[0]
 	switch function {
 	case FuncReadCoils:
-		return s.readBits(function, pdu, s.handler.ReadCoils, MaxReadCoils)
+		return s.readBits(unitID, function, pdu, s.handler.ReadCoils, MaxReadCoils)
 	case FuncReadDiscreteInputs:
-		return s.readBits(function, pdu, s.handler.ReadDiscreteInputs, MaxReadDiscreteInputs)
+		return s.readBits(unitID, function, pdu, s.handler.ReadDiscreteInputs, MaxReadDiscreteInputs)
 	case FuncReadHoldingRegisters:
-		return s.readRegisters(function, pdu, s.handler.ReadHoldingRegisters, MaxReadRegisters)
+		return s.readRegisters(unitID, function, pdu, s.handler.ReadHoldingRegisters, MaxReadRegisters)
 	case FuncReadInputRegisters:
-		return s.readRegisters(function, pdu, s.handler.ReadInputRegisters, MaxReadRegisters)
+		return s.readRegisters(unitID, function, pdu, s.handler.ReadInputRegisters, MaxReadRegisters)
 	case FuncWriteSingleCoil:
-		return s.writeSingleCoil(pdu)
+		return s.writeSingleCoil(unitID, pdu)
 	case FuncWriteSingleRegister:
-		return s.writeSingleRegister(pdu)
+		return s.writeSingleRegister(unitID, pdu)
 	case FuncWriteMultipleCoils:
-		return s.writeMultipleCoils(pdu)
+		return s.writeMultipleCoils(unitID, pdu)
 	case FuncWriteMultipleRegisters:
-		return s.writeMultipleRegisters(pdu)
+		return s.writeMultipleRegisters(unitID, pdu)
 	case FuncMaskWriteRegister:
-		return s.maskWriteRegister(pdu)
+		return s.maskWriteRegister(unitID, pdu)
 	case FuncReadWriteMultipleRegisters:
-		return s.readWriteMultipleRegisters(pdu)
+		return s.readWriteMultipleRegisters(unitID, pdu)
 	default:
 		return buildExceptionResponse(function, ExceptionIllegalFunction)
 	}
 }
 
-func (s *Server) readBits(function byte, pdu []byte, read func(uint16, uint16) ([]bool, error), limit int) []byte {
+func (s *Server) readBits(unitID byte, function byte, pdu []byte, read func(byte, uint16, uint16) ([]bool, error), limit int) []byte {
 	address, quantity, err := parseReadRequest(pdu, function)
 	if err != nil {
 		return s.parseFailure(function, err)
@@ -207,14 +215,14 @@ func (s *Server) readBits(function byte, pdu []byte, read func(uint16, uint16) (
 	if err := checkQuantity(quantity, 1, limit); err != nil {
 		return buildExceptionResponse(function, ExceptionIllegalDataValue)
 	}
-	values, err := read(address, quantity)
+	values, err := read(unitID, address, quantity)
 	if err != nil {
 		return buildExceptionResponse(function, exceptionCodeOf(err))
 	}
 	return buildBitsResponse(function, values)
 }
 
-func (s *Server) readRegisters(function byte, pdu []byte, read func(uint16, uint16) ([]uint16, error), limit int) []byte {
+func (s *Server) readRegisters(unitID byte, function byte, pdu []byte, read func(byte, uint16, uint16) ([]uint16, error), limit int) []byte {
 	address, quantity, err := parseReadRequest(pdu, function)
 	if err != nil {
 		return s.parseFailure(function, err)
@@ -222,36 +230,36 @@ func (s *Server) readRegisters(function byte, pdu []byte, read func(uint16, uint
 	if err := checkQuantity(quantity, 1, limit); err != nil {
 		return buildExceptionResponse(function, ExceptionIllegalDataValue)
 	}
-	values, err := read(address, quantity)
+	values, err := read(unitID, address, quantity)
 	if err != nil {
 		return buildExceptionResponse(function, exceptionCodeOf(err))
 	}
 	return buildRegistersResponse(function, values)
 }
 
-func (s *Server) writeSingleCoil(pdu []byte) []byte {
+func (s *Server) writeSingleCoil(unitID byte, pdu []byte) []byte {
 	address, on, err := parseWriteSingleCoilRequest(pdu)
 	if err != nil {
 		return s.parseFailure(FuncWriteSingleCoil, err)
 	}
-	if err := s.handler.WriteSingleCoil(address, on); err != nil {
+	if err := s.handler.WriteSingleCoil(unitID, address, on); err != nil {
 		return buildExceptionResponse(FuncWriteSingleCoil, exceptionCodeOf(err))
 	}
 	return buildWriteEchoResponse(pdu, 5)
 }
 
-func (s *Server) writeSingleRegister(pdu []byte) []byte {
+func (s *Server) writeSingleRegister(unitID byte, pdu []byte) []byte {
 	address, value, err := parseWriteSingleRegisterRequest(pdu)
 	if err != nil {
 		return s.parseFailure(FuncWriteSingleRegister, err)
 	}
-	if err := s.handler.WriteSingleRegister(address, value); err != nil {
+	if err := s.handler.WriteSingleRegister(unitID, address, value); err != nil {
 		return buildExceptionResponse(FuncWriteSingleRegister, exceptionCodeOf(err))
 	}
 	return buildWriteEchoResponse(pdu, 5)
 }
 
-func (s *Server) writeMultipleCoils(pdu []byte) []byte {
+func (s *Server) writeMultipleCoils(unitID byte, pdu []byte) []byte {
 	address, quantity, values, err := parseWriteMultipleCoilsRequest(pdu)
 	if err != nil {
 		return s.parseFailure(FuncWriteMultipleCoils, err)
@@ -259,13 +267,13 @@ func (s *Server) writeMultipleCoils(pdu []byte) []byte {
 	if err := checkQuantity(quantity, 1, MaxWriteCoils); err != nil {
 		return buildExceptionResponse(FuncWriteMultipleCoils, ExceptionIllegalDataValue)
 	}
-	if err := s.handler.WriteMultipleCoils(address, values); err != nil {
+	if err := s.handler.WriteMultipleCoils(unitID, address, values); err != nil {
 		return buildExceptionResponse(FuncWriteMultipleCoils, exceptionCodeOf(err))
 	}
 	return buildWriteEchoResponse(pdu, 5)
 }
 
-func (s *Server) writeMultipleRegisters(pdu []byte) []byte {
+func (s *Server) writeMultipleRegisters(unitID byte, pdu []byte) []byte {
 	address, quantity, values, err := parseWriteMultipleRegistersRequest(pdu)
 	if err != nil {
 		return s.parseFailure(FuncWriteMultipleRegisters, err)
@@ -273,14 +281,14 @@ func (s *Server) writeMultipleRegisters(pdu []byte) []byte {
 	if err := checkQuantity(quantity, 1, MaxWriteRegisters); err != nil {
 		return buildExceptionResponse(FuncWriteMultipleRegisters, ExceptionIllegalDataValue)
 	}
-	if err := s.handler.WriteMultipleRegisters(address, values); err != nil {
+	if err := s.handler.WriteMultipleRegisters(unitID, address, values); err != nil {
 		return buildExceptionResponse(FuncWriteMultipleRegisters, exceptionCodeOf(err))
 	}
 	return buildWriteEchoResponse(pdu, 5)
 }
 
 // maskWriteRegister 处理 0x16：处理器没实现 MaskWriteHandler 时回非法功能码。
-func (s *Server) maskWriteRegister(pdu []byte) []byte {
+func (s *Server) maskWriteRegister(unitID byte, pdu []byte) []byte {
 	address, andMask, orMask, err := parseMaskWriteRegisterRequest(pdu)
 	if err != nil {
 		return s.parseFailure(FuncMaskWriteRegister, err)
@@ -289,7 +297,7 @@ func (s *Server) maskWriteRegister(pdu []byte) []byte {
 	if !ok {
 		return buildExceptionResponse(FuncMaskWriteRegister, ExceptionIllegalFunction)
 	}
-	if err := handler.MaskWriteRegister(address, andMask, orMask); err != nil {
+	if err := handler.MaskWriteRegister(unitID, address, andMask, orMask); err != nil {
 		return buildExceptionResponse(FuncMaskWriteRegister, exceptionCodeOf(err))
 	}
 	// 0x16 的响应完整回显请求：功能码 + 地址 + 与掩码 + 或掩码。
@@ -297,7 +305,7 @@ func (s *Server) maskWriteRegister(pdu []byte) []byte {
 }
 
 // readWriteMultipleRegisters 处理 0x17：先写一段，再把读地址的内容回给主站。
-func (s *Server) readWriteMultipleRegisters(pdu []byte) []byte {
+func (s *Server) readWriteMultipleRegisters(unitID byte, pdu []byte) []byte {
 	readAddress, readQuantity, writeAddress, values, err := parseReadWriteMultipleRegistersRequest(pdu)
 	if err != nil {
 		return s.parseFailure(FuncReadWriteMultipleRegisters, err)
@@ -312,7 +320,7 @@ func (s *Server) readWriteMultipleRegisters(pdu []byte) []byte {
 	if err := checkQuantity(uint16(len(values)), 1, MaxReadWriteWriteRegisters); err != nil {
 		return buildExceptionResponse(FuncReadWriteMultipleRegisters, ExceptionIllegalDataValue)
 	}
-	result, err := handler.ReadWriteMultipleRegisters(readAddress, readQuantity, writeAddress, values)
+	result, err := handler.ReadWriteMultipleRegisters(unitID, readAddress, readQuantity, writeAddress, values)
 	if err != nil {
 		return buildExceptionResponse(FuncReadWriteMultipleRegisters, exceptionCodeOf(err))
 	}

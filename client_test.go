@@ -110,11 +110,6 @@ func newTestClient(t *testing.T, cfg Config, replies ...[]byte) (*Client, *mockT
 	return c, mt
 }
 
-// rtuReply 构造一个 RTU 响应帧。
-func rtuReply(unitID byte, pdu ...byte) []byte {
-	return BuildFrame(ModeRTU, unitID, pdu)
-}
-
 // rtuReplyFunc 构造一个功能码与数据分开书写的 RTU 响应帧。
 func rtuReplyFunc(unitID, function byte, data ...byte) []byte {
 	return BuildFrame(ModeRTU, unitID, append([]byte{function}, data...))
